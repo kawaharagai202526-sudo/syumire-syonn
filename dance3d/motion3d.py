@@ -92,6 +92,13 @@ def weak_perspective_depth(kp2d, world, f_px, valid):
     return Z
 
 
+def sim_mat(p):
+    """(log_s, theta, tx, ty) -> 3x3 similarity matrix."""
+    sc = np.exp(p[0])
+    c, si = sc * np.cos(p[1]), sc * np.sin(p[1])
+    return np.array([[c, -si, p[2]], [si, c, p[3]], [0, 0, 1.0]])
+
+
 def rotation_to_align(a, b):
     """Rotation matrix taking unit vector a to unit vector b."""
     a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
@@ -128,6 +135,7 @@ def main():
     ap.add_argument("--travel-smooth", type=float, default=0.8, help="floor-position smoothing window (s)")
     ap.add_argument("--depth-gain", type=float, default=0.6,
                     help="scale of front/back travel (depth estimate is noisy, so it is damped)")
+    ap.add_argument("--camera", default="", help="camera.npz from camera.py (zoom/pan compensation)")
     args = ap.parse_args()
 
     z = np.load(args.motion)
@@ -141,6 +149,18 @@ def main():
     world, flipped = fix_lr_flips(world, valid)
     kp2d[flipped] = kp2d[flipped][:, FLIP_PERM]  # 2D labels follow the same fix
     print(f"left/right flips fixed: {flipped.sum()}")
+
+    # ---- camera zoom / pan compensation: express 2D keypoints in the reference view
+    if args.camera:
+        T = np.load(args.camera)["T"]
+        if len(T) < n:
+            T = np.vstack([T, np.repeat(T[-1:], n - len(T), axis=0)])
+        for t in range(n):
+            if valid[t]:
+                M = sim_mat(T[t])
+                kp2d[t, :, :2] = kp2d[t, :, :2] @ M[:2, :2].T + M[:2, 2]
+        zf = np.exp(T[:n, 0])
+        print(f"camera compensation applied (zoom factor {zf.min():.2f}..{zf.max():.2f})")
 
     # ---- global position on the floor
     f_px = (W / 2) / np.tan(np.radians(args.fov) / 2)
@@ -158,10 +178,23 @@ def main():
     root = cam * np.array([1, -1, -1])
 
     # ---- fill gaps & smooth the body pose (relative to hip centre)
+    win = max(5, int(args.smooth * fps) | 1)
     rel = np.where(valid[:, None, None], world, np.nan)
+    # drop single-frame glitches: frames far from a robustly smoothed version of themselves
+    ok = valid.copy()
+    for _ in range(2):
+        tmp = nan_interp(np.where(ok[:, None, None], rel, np.nan), max_gap=int(args.max_gap * fps))
+        have0 = ~np.isnan(tmp[:, 0, 0])
+        med = tmp.copy()
+        med[have0] = median_filter(tmp[have0], size=(5, 1, 1), mode="nearest")
+        sm = smooth_runs(np.nan_to_num(med), have0, win, 2)
+        dev = np.linalg.norm(np.nan_to_num(rel) - sm, axis=2).mean(axis=1)
+        thr = max(0.06, 3.0 * np.median(dev[ok])) if ok.any() else 0.06
+        ok &= ~(dev > thr)
+    print(f"glitch frames removed: {(valid & ~ok).sum()}")
+    rel = np.where(ok[:, None, None], rel, np.nan)
     rel = nan_interp(rel, max_gap=int(args.max_gap * fps))
     have = ~np.isnan(rel[:, 0, 0]) & ~np.isnan(root[:, 0])
-    win = max(5, int(args.smooth * fps) | 1)
     rel = smooth_runs(np.nan_to_num(rel), have, win, 3)
 
     lengths = {}

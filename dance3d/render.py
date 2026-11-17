@@ -260,6 +260,11 @@ def draw_body(img, cam, J, grey=False):
 
     for a, b, r, side in LIMBS:
         pa, pb = p[a], p[b]
+        if a == "NECK":
+            # the neck always sits behind the head spheres (never painted over the head)
+            pb = p["HEADC"] - p["_up"] * 0.05
+            prims.append((depth(p["HEADC"]) + 0.08, "cap", (pa, pb, r, SIDE_COL[side])))
+            continue
         prims.append(((depth(pa) + depth(pb)) / 2, "cap", (pa, pb, r, SIDE_COL[side])))
     for j, side, r in JOINTS:
         prims.append((depth(p[j]) + 0.01, "sph", (p[j], r, shade(SIDE_COL[side], 0.95))))
@@ -566,7 +571,8 @@ def _init(path, args):
 def _render_chunk(job):
     k, times, out_path, fps_out = job
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W_OUT}x{H_OUT}",
-           "-r", f"{fps_out}", "-i", "-", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+           "-r", f"{fps_out}", "-i", "-", "-c:v", "libx264", "-preset", _SCENE.args.preset,
+           "-crf", str(_SCENE.args.crf), "-tune", "animation",
            "-pix_fmt", "yuv420p", out_path]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     for i, t in enumerate(times):
@@ -592,6 +598,8 @@ def main():
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
     ap.add_argument("--audio", default="", help="video/audio file whose sound is added (speed 1.0 only)")
     ap.add_argument("--still", type=float, default=-1, help="render a single PNG at this time (s) and exit")
+    ap.add_argument("--crf", type=int, default=23, help="x264 quality (lower = better, bigger)")
+    ap.add_argument("--preset", default="medium", help="x264 preset")
     args = ap.parse_args()
 
     data = np.load(args.motion3d)

@@ -2,15 +2,17 @@
 """Find one dancer (by hair colour, default: blonde) in a group dance video and extract
 that dancer's 2D + 3D pose for every frame.
 
-Pass 1  every dancer: MediaPipe PoseLandmarker (multi-person) + hair segmentation on the
-        head crop + clothing colour histogram.
-Select  dancers are linked into tracklets; the tracklets whose hair is the most
-        "blonde" (bright + yellow) and whose clothes match are chosen as the target.
-Pass 2  the target is re-estimated on a crop centred on them (heavy model), which
-        is more accurate and also fills frames where pass 1 lost them.
+Pass 1  every dancer: YOLOX person boxes on every frame; every N frames also a
+        MediaPipe pose on each person's crop, hair segmentation of the head (hair
+        colour) and a clothing colour histogram of the torso.
+Select  boxes are linked into tracklets; the tracklets whose hair is the most
+        "blonde" (light + yellow) are the seed, then neighbouring tracklets are
+        stitched on by position, hair colour and clothes.
+Pass 2  the target is re-estimated on a crop centred on them every frame (heavy
+        model, video mode), which is accurate and fills frames pass 1 missed.
 
-Output: an .npz with per-frame 2D keypoints (full-frame pixels) and MediaPipe world
-landmarks (metres, hip centred) of the target, plus a debug overlay video if asked.
+Output: .npz with per-frame 2D keypoints (full-frame pixels), MediaPipe world landmarks
+(metres, hip centred) and box of the target, plus a debug overlay video if asked.
 """
 import argparse
 import os
@@ -20,8 +22,10 @@ import time
 import cv2
 import mediapipe as mp
 import numpy as np
+import onnxruntime as ort
 from mediapipe.tasks import python as mpt
 from mediapipe.tasks.python import vision
+from scipy.ndimage import median_filter
 from scipy.optimize import linear_sum_assignment
 from scipy.signal import savgol_filter
 
@@ -34,10 +38,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # --------------------------------------------------------------------------- models
 
-def pose_landmarker(model_path, num_poses, conf=0.3):
+def pose_landmarker(model_path, num_poses, video=True, conf=0.3):
     opts = vision.PoseLandmarkerOptions(
         base_options=mpt.BaseOptions(model_asset_path=model_path),
-        running_mode=vision.RunningMode.VIDEO,
+        running_mode=vision.RunningMode.VIDEO if video else vision.RunningMode.IMAGE,
         num_poses=num_poses,
         min_pose_detection_confidence=conf,
         min_pose_presence_confidence=conf,
@@ -56,6 +60,46 @@ def hair_segmenter(model_path):
     return vision.ImageSegmenter.create_from_options(opts)
 
 
+class PersonDetector:
+    """YOLOX (ONNX, COCO) person detector."""
+
+    def __init__(self, path, size=640, threads=0):
+        so = ort.SessionOptions()
+        if threads:
+            so.intra_op_num_threads = threads
+        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        self.size = size
+        g, s = [], []
+        for st in (8, 16, 32):
+            h = w = size // st
+            xv, yv = np.meshgrid(np.arange(w), np.arange(h))
+            g.append(np.stack((xv, yv), 2).reshape(-1, 2))
+            s.append(np.full((h * w, 1), st))
+        self.grid = np.concatenate(g).astype(np.float32)
+        self.stride = np.concatenate(s).astype(np.float32)
+
+    def __call__(self, img, thr=0.4, nms=0.5):
+        size = self.size
+        r = min(size / img.shape[0], size / img.shape[1])
+        pad = np.full((size, size, 3), 114, np.uint8)
+        rs = cv2.resize(img, (int(img.shape[1] * r), int(img.shape[0] * r)), interpolation=cv2.INTER_LINEAR)
+        pad[:rs.shape[0], :rs.shape[1]] = rs
+        x = np.ascontiguousarray(pad.transpose(2, 0, 1)[None], np.float32)
+        out = self.sess.run(None, {self.sess.get_inputs()[0].name: x})[0][0]
+        score = out[:, 4] * out[:, 5]  # objectness * P(person)
+        m = score > thr
+        if not m.any():
+            return np.zeros((0, 4), np.float32), np.zeros(0, np.float32)
+        xy = (out[m, :2] + self.grid[m]) * self.stride[m]
+        wh = np.exp(out[m, 2:4]) * self.stride[m]
+        boxes = np.concatenate([xy - wh / 2, xy + wh / 2], 1) / r
+        score = score[m]
+        keep = cv2.dnn.NMSBoxes([[float(b[0]), float(b[1]), float(b[2] - b[0]), float(b[3] - b[1])] for b in boxes],
+                                score.tolist(), thr, nms)
+        keep = np.array(keep, int).ravel()
+        return boxes[keep].astype(np.float32), score[keep].astype(np.float32)
+
+
 def to_mp(img_bgr):
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     return mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
@@ -70,6 +114,14 @@ def unpack(res, sx, sy, ox=0.0, oy=0.0):
         wp = np.array([[p.x, p.y, p.z] for p in wl], dtype=np.float32)
         out.append((kp, wp))
     return out
+
+
+def box_iou(a, b):
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
 
 
 # --------------------------------------------------------------------------- appearance
@@ -102,14 +154,14 @@ def crop_square(frame, x0, y0, side, out=None):
     if sx1 > sx0 and sy1 > sy0:
         crop[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = frame[sy0:sy1, sx0:sx1]
     if out is not None:
-        crop = cv2.resize(crop, (out, out), interpolation=cv2.INTER_LINEAR if side < out else cv2.INTER_AREA)
+        crop = cv2.resize(crop, (out, out), interpolation=cv2.INTER_CUBIC if side < out else cv2.INTER_AREA)
     return crop, x0, y0, side
 
 
 def hair_color(frame, kp, seg):
     """Median Lab colour of the hair pixels of one person. Returns (L, a, b, n_pixels) or None."""
     x0, y0, side = head_crop_box(kp)
-    if side < 12:
+    if side < 10:
         return None
     crop, _, _, _ = crop_square(frame, x0, y0, side, out=256)
     res = seg.segment(to_mp(crop))
@@ -151,35 +203,34 @@ def clothes_hist(frame, kp):
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     hs = cv2.calcHist([hsv], [0, 1], mask, [12, 4], [0, 180, 0, 256]).ravel()
     v = cv2.calcHist([hsv], [2], mask, [6], [0, 256]).ravel()
-    vec = np.concatenate([hs / max(hs.sum(), 1), v / max(v.sum(), 1)]).astype(np.float32)
-    return vec
+    return np.concatenate([hs / max(hs.sum(), 1), v / max(v.sum(), 1)]).astype(np.float32)
 
 
 def hist_sim(a, b):
     return float(np.minimum(a, b).sum() / 2.0)  # two normalised parts -> [0, 1]
 
 
+def pose_in_box(lm, frame, box, crop_px=256):
+    """MediaPipe pose (image mode) of the person inside `box`."""
+    H, W = frame.shape[:2]
+    x0, y0, x1, y1 = box
+    side = max(x1 - x0, y1 - y0) * 1.2
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    crop, ox, oy, side_i = crop_square(frame, cx - side / 2, cy - side / 2, side, out=crop_px)
+    res = lm.detect(to_mp(crop))
+    s = side_i / crop_px
+    best, best_q = None, -1e9
+    for kp, wp in unpack(res, crop_px * s, crop_px * s, ox, oy):
+        b2 = bbox_from_kp(kp, W, H)
+        q = box_iou(b2, box) - np.linalg.norm(body_center(kp) - [cx, cy]) / max(y1 - y0, 1)
+        if q > best_q:
+            best, best_q = (kp, wp), q
+    if best is None or best_q < 0.05:
+        return None
+    return best
+
+
 # --------------------------------------------------------------------------- pass 1
-
-def merge_duplicates(found, W, H):
-    """Drop detections of the same person coming from overlapping tiles."""
-    found = sorted(found, key=lambda x: -x[2])
-    keep = []
-    for kp, wp, q in found:
-        b = bbox_from_kp(kp, W, H)
-        h = max(b[3] - b[1], 20)
-        c = body_center(kp)
-        dup = False
-        for kp2, _, _ in keep:
-            b2 = bbox_from_kp(kp2, W, H)
-            h2 = max(b2[3] - b2[1], 20)
-            if np.linalg.norm(body_center(kp2) - c) < 0.2 * max(h, h2) and abs(np.log(h / h2)) < 0.4:
-                dup = True
-                break
-        if not dup:
-            keep.append((kp, wp, q))
-    return keep
-
 
 def pass1(video, args):
     cap = cv2.VideoCapture(video)
@@ -188,75 +239,74 @@ def pass1(video, args):
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n_max = n_total if args.max_frames <= 0 else min(n_total, args.max_frames)
-    scale = min(1.0, args.pass1_width / W)
-    # optional overlapping tiles (full height, square-ish) so small dancers look bigger
-    if args.tiles > 1:
-        tw = min(W, max(H, int(W / args.tiles * 1.5)))
-        xs = np.linspace(0, W - tw, args.tiles).astype(int)
-        tiles = [(int(x), 0, tw, H) for x in xs]
-    else:
-        tiles = [(0, 0, W, H)]
-    lms = [pose_landmarker(args.model_pass1, args.num_poses, conf=args.conf) for _ in tiles]
+    det = PersonDetector(args.detector_model)
+    lm = pose_landmarker(args.model_pass1, 2, video=False, conf=0.3)
     seg = hair_segmenter(args.hair_model)
 
-    det_frame, det_kp, det_world, det_hair, det_hist = [], [], [], [], []
+    rows = dict(frame=[], box=[], score=[], kp=[], world=[], hair=[], hist=[])
+    nan_kp = np.full((NUM_LM, 3), np.nan, np.float32)
     t0 = time.time()
     i = 0
     while i < n_max:
         ok, frame = cap.read()
         if not ok:
             break
-        found = []
-        for (tx, ty, tw_, th_), lm in zip(tiles, lms):
-            sub = frame[ty:ty + th_, tx:tx + tw_]
-            proc = cv2.resize(sub, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else sub
-            res = lm.detect_for_video(to_mp(proc), int(round(i * 1000.0 / fps)))
-            for kp, wp in unpack(res, tw_, th_, tx, ty):
-                # how central the person is inside this tile (prefer central copies when merging)
-                cxk = body_center(kp)[0]
-                centrality = 1.0 - abs((cxk - tx) / tw_ - 0.5) * 2
-                found.append((kp, wp, centrality + kp[:, 2].mean()))
-        found = merge_duplicates(found, W, H) if len(tiles) > 1 else found
-        for kp, wp, _ in found:
-            det_frame.append(i)
-            det_kp.append(kp)
-            det_world.append(wp)
-            hc = hair_color(frame, kp, seg) if i % args.hair_every == 0 else None
-            det_hair.append(hc if hc is not None else np.full(4, np.nan, np.float32))
-            ch = clothes_hist(frame, kp)
-            det_hist.append(ch if ch is not None else np.full(54, np.nan, np.float32))
+        boxes, scores = det(frame, thr=args.det_thr)
+        for b, s in zip(boxes, scores):
+            if (b[3] - b[1]) < args.min_height * H:
+                continue
+            kp = wp = None
+            hair = hist = None
+            if i % args.hair_every == 0:
+                r = pose_in_box(lm, frame, b)
+                if r is not None:
+                    kp, wp = r
+                    hair = hair_color(frame, kp, seg)
+                    hist = clothes_hist(frame, kp)
+            rows["frame"].append(i)
+            rows["box"].append(b)
+            rows["score"].append(s)
+            rows["kp"].append(kp if kp is not None else nan_kp)
+            rows["world"].append(wp if wp is not None else nan_kp)
+            rows["hair"].append(hair if hair is not None else np.full(4, np.nan, np.float32))
+            rows["hist"].append(hist if hist is not None else np.full(54, np.nan, np.float32))
         i += 1
-        if i % 100 == 0:
+        if i % 200 == 0:
             el = time.time() - t0
-            print(f"[pass1] {i}/{n_max} frames  {i / el:.1f} fps  dets={len(det_frame)}", flush=True)
+            print(f"[pass1] {i}/{n_max} frames  {i / el:.1f} fps  dets={len(rows['frame'])}", flush=True)
     cap.release()
-    for lm in lms:
-        lm.close()
+    lm.close()
     seg.close()
     return dict(fps=fps, W=W, H=H, n=i,
-                det_frame=np.array(det_frame, np.int32),
-                det_kp=np.array(det_kp, np.float32).reshape(-1, NUM_LM, 3),
-                det_world=np.array(det_world, np.float32).reshape(-1, NUM_LM, 3),
-                det_hair=np.array(det_hair, np.float32).reshape(-1, 4),
-                det_hist=np.array(det_hist, np.float32).reshape(-1, 54))
+                det_frame=np.array(rows["frame"], np.int32),
+                det_box=np.array(rows["box"], np.float32).reshape(-1, 4),
+                det_score=np.array(rows["score"], np.float32),
+                det_kp=np.array(rows["kp"], np.float32).reshape(-1, NUM_LM, 3),
+                det_world=np.array(rows["world"], np.float32).reshape(-1, NUM_LM, 3),
+                det_hair=np.array(rows["hair"], np.float32).reshape(-1, 4),
+                det_hist=np.array(rows["hist"], np.float32).reshape(-1, 54))
 
 
 # --------------------------------------------------------------------------- tracking
 
-def build_tracklets(p1, max_gap=10):
+def box_geom(p1):
+    b = p1["det_box"]
+    centers = np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], 1)
+    heights = np.maximum(b[:, 3] - b[:, 1], 20)
+    return centers, heights
+
+
+def build_tracklets(p1, max_gap=8):
     n = p1["n"]
     fr = p1["det_frame"]
-    kp = p1["det_kp"]
-    W, H = p1["W"], p1["H"]
-    centers = body_center(kp)
-    boxes = np.array([bbox_from_kp(k, W, H) for k in kp]) if len(kp) else np.zeros((0, 4))
-    heights = np.maximum(boxes[:, 3] - boxes[:, 1], 20) if len(kp) else np.zeros(0)
+    boxes = p1["det_box"]
+    centers, heights = box_geom(p1)
     hist = p1["det_hist"]
     by_frame = [[] for _ in range(n)]
     for d, f in enumerate(fr):
         by_frame[f].append(d)
 
-    tracks = []  # each: dict(dets=[...], last=frame, c=center, v=velocity, h=height, hist=vec)
+    tracks = []
     tid_of = np.full(len(fr), -1, np.int32)
     for t in range(n):
         cands = by_frame[t]
@@ -267,15 +317,17 @@ def build_tracklets(p1, max_gap=10):
                 tr = tracks[k]
                 gap = t - tr["last"]
                 pred = tr["c"] + tr["v"] * gap
+                pbox = tr["box"] + np.r_[tr["v"], tr["v"]] * gap
                 for b, d in enumerate(cands):
                     dist = np.linalg.norm(centers[d] - pred) / max(tr["h"], heights[d])
-                    if dist > 0.35 + 0.04 * gap:
+                    if dist > 0.3 + 0.04 * gap:
                         continue
+                    iou = box_iou(pbox, boxes[d])
                     hs = 0.0
                     if not np.isnan(hist[d, 0]) and tr["hist"] is not None:
                         hs = 1.0 - hist_sim(hist[d], tr["hist"])
                     dh = abs(np.log(heights[d] / tr["h"]))
-                    cost[a, b] = dist + 0.4 * hs + 0.3 * dh
+                    cost[a, b] = dist + 0.5 * (1 - iou) + 0.4 * hs + 0.3 * dh
             ra, cb = linear_sum_assignment(cost)
             used = set()
             for a, b in zip(ra, cb):
@@ -286,15 +338,16 @@ def build_tracklets(p1, max_gap=10):
                 gap = t - tr["last"]
                 v_new = (centers[d] - tr["c"]) / gap
                 tr["v"] = 0.6 * tr["v"] + 0.4 * v_new
-                tr["c"], tr["h"], tr["last"] = centers[d], 0.8 * tr["h"] + 0.2 * heights[d], t
+                tr["c"], tr["box"], tr["last"] = centers[d], boxes[d].copy(), t
+                tr["h"] = 0.7 * tr["h"] + 0.3 * heights[d]
                 if not np.isnan(hist[d, 0]):
-                    tr["hist"] = hist[d] if tr["hist"] is None else 0.9 * tr["hist"] + 0.1 * hist[d]
+                    tr["hist"] = hist[d] if tr["hist"] is None else 0.85 * tr["hist"] + 0.15 * hist[d]
                 tr["dets"].append(d)
                 tid_of[d] = k
                 used.add(d)
             cands = [d for d in cands if d not in used]
         for d in cands:
-            tracks.append(dict(dets=[d], last=t, c=centers[d], v=np.zeros(2), h=heights[d],
+            tracks.append(dict(dets=[d], last=t, c=centers[d], v=np.zeros(2), h=heights[d], box=boxes[d].copy(),
                                hist=None if np.isnan(hist[d, 0]) else hist[d].copy()))
             tid_of[d] = len(tracks) - 1
     return tracks, tid_of, centers, heights
@@ -329,6 +382,7 @@ def select_target(p1, tracks, stats, centers, heights, args):
     cand = [s for s in stats if s["n"] >= min_len and s["n_hair"] >= 2 and not np.isnan(s["blonde"])]
     if not cand:
         raise SystemExit("no usable tracklets found")
+    others = float(np.median([s["blonde"] for s in cand]))
 
     # ---- seed tracklet
     if args.hint:
@@ -347,14 +401,13 @@ def select_target(p1, tracks, stats, centers, heights, args):
         seed = best
         print(f"[select] seed from hint: tracklet {seed['id']}")
     else:
-        others = np.median([s["blonde"] for s in cand])
         # evidence = how much lighter than the others x how many hair samples back it up
         seed = max(cand, key=lambda s: (s["blonde"] - others) * min(s["n_hair"], 60))
         print(f"[select] seed tracklet {seed['id']} blonde={seed['blonde']:.1f} (median of all {others:.1f}) "
-              f"len={seed['n']}")
+              f"len={seed['n']} frames {seed['f0']}-{seed['f1']}")
 
     seed_b = seed["blonde"]
-    base_b = np.median([s["blonde"] for s in cand])
+    base_b = others
     span = max(seed_b - base_b, 15.0)
     # when the target's hair is not much lighter than the others, rely more on clothing colour
     w_hair = args.w_hair * float(np.clip((seed_b - base_b) / 40.0, 0.15, 1.0))
@@ -363,10 +416,7 @@ def select_target(p1, tracks, stats, centers, heights, args):
         hs = 0.5
         if s["hist"] is not None and seed["hist"] is not None:
             hs = hist_sim(s["hist"], seed["hist"])
-        if np.isnan(s["blonde"]):
-            bz = 0.3
-        else:
-            bz = np.clip((s["blonde"] - base_b) / span, -1, 1.5)
+        bz = 0.3 if np.isnan(s["blonde"]) else np.clip((s["blonde"] - base_b) / span, -1, 1.5)
         return w_hair * bz + args.w_clothes * (hs - 0.5) * 2
 
     scored = sorted(((score(s), s) for s in stats if s["n"] >= 3), key=lambda x: -x[0])
@@ -394,7 +444,6 @@ def select_target(p1, tracks, stats, centers, heights, args):
             gap = (f_s - f_end) if forward else (f_end - f_s)
             if gap < -3 or gap > max_gap:
                 continue
-            # it must extend beyond cur in the walking direction
             if forward and s["f1"] <= cur["f1"]:
                 continue
             if not forward and s["f0"] >= cur["f0"]:
@@ -448,10 +497,8 @@ def select_target(p1, tracks, stats, centers, heights, args):
     if seed_b - base_b < 40:
         print("[select] hair colours are not very distinct -> hair safety check skipped")
     elif len(samp) > 9:
-        from scipy.ndimage import median_filter
         zs = median_filter(hz[samp], size=9, mode="nearest")
-        bad = samp[zs < args.hair_drop]
-        for f in bad:
+        for f in samp[zs < args.hair_drop]:
             lo, hi = max(f - args.hair_every, 0), min(f + args.hair_every + 1, n)
             dropped += int((owner[lo:hi] >= 0).sum())
             owner[lo:hi] = -1
@@ -463,71 +510,91 @@ def select_target(p1, tracks, stats, centers, heights, args):
 
 # --------------------------------------------------------------------------- pass 2
 
-def plan_crops(p1, owner, heights, max_gap_s=2.0):
+def plan_crops(p1, owner, max_gap_s=2.0):
     """Smoothed square crop (cx, cy, side) per frame around the target, NaN where unknown."""
     n, fps = p1["n"], p1["fps"]
-    kp = p1["det_kp"]
-    W, H = p1["W"], p1["H"]
+    boxes = p1["det_box"]
     raw = np.full((n, 3), np.nan)
     for f in range(n):
         d = owner[f]
         if d < 0:
             continue
-        b = bbox_from_kp(kp[d], W, H)
-        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-        side = max(b[2] - b[0], b[3] - b[1]) * 1.45
-        raw[f] = (cx, cy, side)
+        b = boxes[d]
+        raw[f] = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, max(b[2] - b[0], b[3] - b[1]) * 1.3)
     filled = nan_interp(raw, max_gap=int(max_gap_s * fps))
     good = ~np.isnan(filled[:, 0])
     out = filled.copy()
-    win = int(fps * 0.5) | 1
-    if good.sum() > win:
-        # smooth each contiguous run
-        idx = np.flatnonzero(good)
-        runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
-        for r in runs:
+    win = int(fps * 0.3) | 1
+    idx = np.flatnonzero(good)
+    if len(idx):
+        for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
             if len(r) > win:
                 out[r, 0] = savgol_filter(filled[r, 0], win, 2)
                 out[r, 1] = savgol_filter(filled[r, 1], win, 2)
-                # side: take a running max-ish so limbs are not cut off
-                sm = savgol_filter(filled[r, 2], win * 2 + 1 if len(r) > win * 2 + 1 else win, 1)
-                out[r, 2] = np.maximum(sm, filled[r, 2] * 0.9)
+                out[r, 2] = np.maximum(savgol_filter(filled[r, 2], win, 1), filled[r, 2])
     return out
 
 
 def pass2(video, p1, owner, crops, args):
-    n, fps = p1["n"], p1["fps"]
-    lm = pose_landmarker(args.model_pass2, 2, conf=0.3)
+    """Heavy-model pose on a crop around the target, every frame.
+
+    Image mode (detector runs every frame) with up to 3 people per crop: the pose whose
+    box agrees with the target's YOLOX box is kept, so a dancer in front of the target
+    is not picked up by mistake. Other dancers' boxes are greyed out in the crop.
+    """
+    n = p1["n"]
+    lm = pose_landmarker(args.model_pass2, 3, video=False, conf=0.3)
     kp_out = np.full((n, NUM_LM, 3), np.nan, np.float32)
     w_out = np.full((n, NUM_LM, 3), np.nan, np.float32)
     src = np.zeros(n, np.int8)
+    by_frame = {}
+    for d, f in enumerate(p1["det_frame"]):
+        by_frame.setdefault(int(f), []).append(d)
     cap = cv2.VideoCapture(video)
+    W, H = p1["W"], p1["H"]
     CROP = args.crop_size
     t0 = time.time()
     for f in range(n):
         ok, frame = cap.read()
         if not ok:
             break
-        p1_kp = p1["det_kp"][owner[f]] if owner[f] >= 0 else None
+        d = owner[f]
+        box = p1["det_box"][d] if d >= 0 else None
         if not np.isnan(crops[f, 0]):
             cx, cy, side = crops[f]
-            crop, x0, y0, side_i = crop_square(frame, cx - side / 2, cy - side / 2, side, out=CROP)
-            res = lm.detect_for_video(to_mp(crop), int(round(f * 1000.0 / fps)))
+            work = frame
+            if box is not None:
+                others = [p1["det_box"][o] for o in by_frame.get(f, []) if o != d]
+                if others:
+                    work = frame.copy()
+                    keep = work[int(max(box[1], 0)):int(min(box[3], H)), int(max(box[0], 0)):int(min(box[2], W))].copy()
+                    for ob in others:
+                        x0o, y0o = int(max(ob[0], 0)), int(max(ob[1], 0))
+                        x1o, y1o = int(min(ob[2], W)), int(min(ob[3], H))
+                        work[y0o:y1o, x0o:x1o] = 128
+                    work[int(max(box[1], 0)):int(min(box[3], H)), int(max(box[0], 0)):int(min(box[2], W))] = keep
+            crop, x0, y0, side_i = crop_square(work, cx - side / 2, cy - side / 2, side, out=CROP)
+            res = lm.detect(to_mp(crop))
             s = side_i / CROP
             best, best_cost = None, 1e9
             for kp, wp in unpack(res, CROP * s, CROP * s, x0, y0):
                 c = body_center(kp)
-                if p1_kp is not None:
-                    cost = np.median(np.linalg.norm(kp[:, :2] - p1_kp[:, :2], axis=1)) / side
+                if box is not None:
+                    bh = max(box[3] - box[1], 1)
+                    kb = bbox_from_kp(kp, W, H)
+                    cost = np.linalg.norm(c - [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]) / bh \
+                        + 0.5 * (1 - box_iou(kb, box))
+                    ok_match = cost < 0.45
                 else:
                     cost = np.linalg.norm(c - [cx, cy]) / side
-                if cost < best_cost:
+                    ok_match = cost < 0.12
+                if ok_match and cost < best_cost:
                     best, best_cost = (kp, wp), cost
-            if best is not None and best_cost < (0.12 if p1_kp is not None else 0.25):
+            if best is not None:
                 kp_out[f], w_out[f], src[f] = best[0], best[1], 2
-        if src[f] == 0 and p1_kp is not None:
-            kp_out[f], w_out[f], src[f] = p1_kp, p1["det_world"][owner[f]], 1
-        if (f + 1) % 100 == 0:
+        if src[f] == 0 and d >= 0 and not np.isnan(p1["det_kp"][d, 0, 0]):
+            kp_out[f], w_out[f], src[f] = p1["det_kp"][d], p1["det_world"][d], 1
+        if (f + 1) % 300 == 0:
             print(f"[pass2] {f + 1}/{n}  {(f + 1) / (time.time() - t0):.1f} fps", flush=True)
     cap.release()
     lm.close()
@@ -536,29 +603,33 @@ def pass2(video, p1, owner, crops, args):
 
 # --------------------------------------------------------------------------- debug video
 
-def debug_video(video, out_path, p1, kp, src, every=1):
+def debug_video(video, out_path, p1, kp, src, owner):
     conns = [(c.start, c.end) for c in vision.PoseLandmarksConnections.POSE_LANDMARKS]
     cap = cv2.VideoCapture(video)
     W, H, fps = p1["W"], p1["H"], p1["fps"]
     scale = min(1.0, 960 / W)
     size = (int(W * scale) // 2 * 2, int(H * scale) // 2 * 2)
-    vw = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps / every, size)
+    vw = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    by_frame = {}
+    for d, f in enumerate(p1["det_frame"]):
+        by_frame.setdefault(int(f), []).append(d)
     for f in range(p1["n"]):
         ok, frame = cap.read()
         if not ok:
             break
-        if f % every:
-            continue
         img = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        for d in by_frame.get(f, []):
+            b = p1["det_box"][d] * scale
+            cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (120, 120, 120), 1)
         if src[f] > 0:
             k = kp[f, :, :2] * scale
             col = (0, 255, 255) if src[f] == 2 else (0, 160, 255)
             for a, b in conns:
                 cv2.line(img, tuple(np.int32(k[a])), tuple(np.int32(k[b])), col, 2, cv2.LINE_AA)
-            x0, y0 = k.min(0)
-            x1, y1 = k.max(0)
-            cv2.rectangle(img, (int(x0) - 6, int(y0) - 30), (int(x1) + 6, int(y1) + 6), col, 2)
-            cv2.putText(img, "TARGET", (int(x0), int(y0) - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+        if owner[f] >= 0:
+            b = p1["det_box"][owner[f]] * scale
+            cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 2)
+            cv2.putText(img, "TARGET", (int(b[0]), int(b[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
         cv2.putText(img, f"{f / fps:6.2f}s", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         vw.write(img)
     vw.release()
@@ -572,12 +643,10 @@ def main():
     ap.add_argument("video")
     ap.add_argument("-o", "--out", default="motion.npz")
     ap.add_argument("--models", default=os.path.join(HERE, "models"))
-    ap.add_argument("--num-poses", type=int, default=6, help="max dancers to detect in pass 1")
-    ap.add_argument("--conf", type=float, default=0.3)
-    ap.add_argument("--pass1-width", type=int, default=1920)
-    ap.add_argument("--tiles", type=int, default=1, help="split the frame into N overlapping tiles in pass 1")
-    ap.add_argument("--hair-every", type=int, default=3, help="run hair segmentation every N frames")
-    ap.add_argument("--crop-size", type=int, default=512)
+    ap.add_argument("--det-thr", type=float, default=0.4, help="person detection score threshold")
+    ap.add_argument("--min-height", type=float, default=0.12, help="ignore people smaller than this x frame height")
+    ap.add_argument("--hair-every", type=int, default=3, help="pose/hair/clothes sampling interval (frames)")
+    ap.add_argument("--crop-size", type=int, default=384)
     ap.add_argument("--hint", default="", help="t_sec,x,y (x,y in 0..1) to point at the target manually")
     ap.add_argument("--w-hair", type=float, default=1.0)
     ap.add_argument("--w-clothes", type=float, default=0.6)
@@ -593,6 +662,7 @@ def main():
     ap.add_argument("--debug-video", default="")
     ap.add_argument("--cache", default="", help="pass-1 cache .npz (reused if it exists)")
     args = ap.parse_args()
+    args.detector_model = os.path.join(args.models, "yolox_s.onnx")
     args.model_pass1 = os.path.join(args.models, "pose_landmarker_full.task")
     args.model_pass2 = os.path.join(args.models, "pose_landmarker_heavy.task")
     args.hair_model = os.path.join(args.models, "hair_segmenter.tflite")
@@ -616,17 +686,20 @@ def main():
         wl = np.full((n, NUM_LM, 3), np.nan, np.float32)
         src = np.zeros(n, np.int8)
         m = owner >= 0
+        m &= ~np.isnan(p1["det_kp"][np.maximum(owner, 0), 0, 0])
         kp[m], wl[m], src[m] = p1["det_kp"][owner[m]], p1["det_world"][owner[m]], 1
     else:
-        crops = plan_crops(p1, owner, heights)
+        crops = plan_crops(p1, owner)
         kp, wl, src = pass2(args.video, p1, owner, crops, args)
 
-    print(f"[done] target found in {(src > 0).mean() * 100:.1f}% of frames "
+    box = np.full((p1["n"], 4), np.nan, np.float32)
+    box[owner >= 0] = p1["det_box"][owner[owner >= 0]]
+    print(f"[done] target box in {(owner >= 0).mean() * 100:.1f}% of frames, pose in {(src > 0).mean() * 100:.1f}% "
           f"(refined {(src == 2).mean() * 100:.1f}%)")
     np.savez_compressed(args.out, fps=p1["fps"], W=p1["W"], H=p1["H"], n=p1["n"],
-                        kp2d=kp, world=wl, src=src, seed_lab=seed["lab"])
+                        kp2d=kp, world=wl, src=src, box=box, seed_lab=seed["lab"])
     if args.debug_video:
-        debug_video(args.video, args.debug_video, p1, kp, src)
+        debug_video(args.video, args.debug_video, p1, kp, src, owner)
         print(f"[debug] wrote {args.debug_video}")
 
 
