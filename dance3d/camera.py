@@ -183,8 +183,8 @@ def main():
             for a_side, b_side in ((main, c), (c, main)):
                 if cls[t - 1] != a_side or cls[t] != b_side:
                     continue
-                a = max([x for x in G if x < t and cls[x] == a_side and t - x < 90], default=None)
-                b = min([x for x in G if x >= t and cls[x] == b_side and x - t < 90], default=None)
+                a = max([x for x in G if x < t and cls[x] == a_side and t - x < 300], default=None)
+                b = min([x for x in G if x >= t and cls[x] == b_side and x - t < 300], default=None)
                 if a is None or b is None:
                     continue
                 # point in ref_c -> ref_main
@@ -214,10 +214,10 @@ def main():
         a = anchors[i - 1] if i > 0 else None
         b = anchors[i] if i < len(anchors) else None
         est, wts = [], []
-        if a is not None and t - a < 150:
+        if a is not None:
             est.append(par(A_abs[a] @ np.linalg.inv(chain(a, t))))
             wts.append(1.0 / (t - a))
-        if b is not None and b - t < 150:
+        if b is not None:
             est.append(par(A_abs[b] @ chain(t, b)))
             wts.append(1.0 / (b - t))
         if est:

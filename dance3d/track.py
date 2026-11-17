@@ -25,7 +25,6 @@ import numpy as np
 import onnxruntime as ort
 from mediapipe.tasks import python as mpt
 from mediapipe.tasks.python import vision
-from scipy.ndimage import median_filter
 from scipy.optimize import linear_sum_assignment
 from scipy.signal import savgol_filter
 
@@ -130,11 +129,16 @@ def head_crop_box(kp):
     """Square box (x0, y0, side) around the head, including all of the hair."""
     face = kp[[NOSE, L_EYE, R_EYE, L_EAR, R_EAR], :2]
     sh_w = np.linalg.norm(kp[L_SH, :2] - kp[R_SH, :2])
+    sh_mid = (kp[L_SH, :2] + kp[R_SH, :2]) / 2
+    hip_mid = (kp[L_HIP, :2] + kp[R_HIP, :2]) / 2
+    torso = np.linalg.norm(sh_mid - hip_mid)
+    # head width: ears / eyes / shoulders all shrink when the dancer turns sideways, the
+    # torso length does not (head width ~ 1/3 of shoulder-to-hip length)
     w = max(np.linalg.norm(kp[L_EAR, :2] - kp[R_EAR, :2]),
             2.2 * np.linalg.norm(kp[L_EYE, :2] - kp[R_EYE, :2]),
-            0.45 * sh_w)
+            0.45 * sh_w,
+            0.36 * torso)
     c = face.mean(0)
-    sh_mid = (kp[L_SH, :2] + kp[R_SH, :2]) / 2
     up = c - sh_mid
     n = np.linalg.norm(up)
     up = up / n if n > 1e-3 else np.array([0.0, -1.0])
@@ -287,6 +291,95 @@ def pass1(video, args):
                 det_hist=np.array(rows["hist"], np.float32).reshape(-1, 54))
 
 
+def refresh_hair(video, p1, seg_path):
+    """Recompute hair colour of every detection that has a pose (used to update a cache)."""
+    seg = hair_segmenter(seg_path)
+    fr, kp = p1["det_frame"], p1["det_kp"]
+    hair = np.full((len(fr), 4), np.nan, np.float32)
+    todo = {}
+    for d in np.flatnonzero(~np.isnan(kp[:, 0, 0])):
+        todo.setdefault(int(fr[d]), []).append(d)
+    cap = cv2.VideoCapture(video)
+    for f in range(p1["n"]):
+        if f not in todo:
+            if not cap.grab():
+                break
+            continue
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for d in todo[f]:
+            h = hair_color(frame, kp[d], seg)
+            if h is not None:
+                hair[d] = h
+    cap.release()
+    seg.close()
+    print(f"[pass1] hair re-sampled: {np.mean(~np.isnan(hair[:, 0])) * 100:.0f}% of detections have a sample")
+    return hair
+
+
+def box_hair_samples(video, p1, seg_path, every=2, crop_px=256):
+    """Hair colour of every detection every `every` frames, from its person box alone.
+
+    The head-and-shoulders part of the box (the framing the hair segmenter is made for) is
+    cropped with the other dancers' boxes greyed out; the value is the 75th percentile of the
+    hair metric over hair pixels in the middle of the crop, so a neighbour's hair at the
+    edge does not count. Independent of pose estimation, which can latch onto an
+    overlapping neighbour.
+    """
+    seg = hair_segmenter(seg_path)
+    fr, boxes = p1["det_frame"], p1["det_box"]
+    W, H = p1["W"], p1["H"]
+    val = np.full(len(fr), np.nan, np.float32)
+    by_frame = {}
+    for d, f in enumerate(fr):
+        by_frame.setdefault(int(f), []).append(d)
+    cap = cv2.VideoCapture(video)
+    xs = np.abs(np.arange(crop_px) - crop_px / 2) / (crop_px / 2)
+    central = np.broadcast_to(xs[None, :] < 0.45, (crop_px, crop_px))
+    t0 = time.time()
+    for f in range(p1["n"]):
+        if f % every:
+            if not cap.grab():
+                break
+            continue
+        ok, frame = cap.read()
+        if not ok:
+            break
+        ds = by_frame.get(f, [])
+        for d in ds:
+            x0, y0, x1, y1 = boxes[d]
+            h = y1 - y0
+            side = 0.42 * h
+            cx, cy = (x0 + x1) / 2, y0 + 0.21 * h
+            work = frame
+            others = [boxes[o] for o in ds if o != d]
+            if others:
+                work = frame.copy()
+                keep = frame[int(max(y0, 0)):int(min(y1, H)), int(max(x0, 0)):int(min(x1, W))].copy()
+                for ob in others:
+                    work[int(max(ob[1], 0)):int(min(ob[3], H)), int(max(ob[0], 0)):int(min(ob[2], W))] = 110
+                work[int(max(y0, 0)):int(min(y1, H)), int(max(x0, 0)):int(min(x1, W))] = keep
+            crop, _, _, _ = crop_square(work, cx - side / 2, cy - side / 2, side, out=crop_px)
+            masks = seg.segment(to_mp(crop)).confidence_masks
+            if not masks:
+                continue
+            m = masks[-1].numpy_view()
+            if m.ndim == 3:
+                m = m[..., 0]
+            sel = (m > 0.5) & central
+            if sel.sum() < 40:
+                continue
+            lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)[sel].astype(np.float32)
+            val[d] = np.percentile(blonde_metric(lab), 75)
+        if (f + 1) % 1200 < every:
+            print(f"[hair] {f + 1}/{p1['n']} frames  {(f + 1) / (time.time() - t0):.0f} fps", flush=True)
+    cap.release()
+    seg.close()
+    print(f"[hair] {np.mean(~np.isnan(val)) * 100:.0f}% of detections have a hair sample")
+    return val
+
+
 # --------------------------------------------------------------------------- tracking
 
 def box_geom(p1):
@@ -353,159 +446,175 @@ def build_tracklets(p1, max_gap=8):
     return tracks, tid_of, centers, heights
 
 
-def tracklet_stats(p1, tracks):
-    hair = p1["det_hair"]
-    hist = p1["det_hist"]
-    stats = []
-    for k, tr in enumerate(tracks):
-        d = np.array(tr["dets"])
-        hv = hair[d]
-        ok = ~np.isnan(hv[:, 0])
-        bm = blonde_metric(hv[ok]) if ok.any() else np.array([])
-        hh = hist[d]
-        hok = ~np.isnan(hh[:, 0])
-        stats.append(dict(
-            id=k, n=len(d), f0=int(p1["det_frame"][d[0]]), f1=int(p1["det_frame"][d[-1]]),
-            n_hair=int(ok.sum()),
-            blonde=float(np.median(bm)) if len(bm) else np.nan,
-            lab=np.median(hv[ok, :3], axis=0) if ok.any() else np.full(3, np.nan),
-            hist=hh[hok].mean(0) if hok.any() else None,
-        ))
-    return stats
+def lighting_classes(video, n):
+    """0 = normal lighting, 1 = dark (the video switches to dim orange light at times)."""
+    cap = cv2.VideoCapture(video)
+    b = np.zeros(n)
+    for t in range(n):
+        if not cap.grab():
+            b[t:] = b[t - 1] if t else 0
+            break
+        if t % 3 == 0:
+            ok, f = cap.retrieve()
+            b[t] = cv2.resize(f, (160, 90), interpolation=cv2.INTER_AREA).mean() if ok else b[t - 1]
+        else:
+            b[t] = b[t - 1]
+    cap.release()
+    lo, hi = np.percentile(b, 10), np.percentile(b, 90)
+    if hi - lo < 25:
+        return np.zeros(n, int)
+    from scipy.ndimage import median_filter
+    return (median_filter(b, size=31, mode="nearest") < (lo + hi) / 2).astype(int)
 
 
-def select_target(p1, tracks, stats, centers, heights, args):
+def appearance_scores(p1, tracks, cls_frame, win=12, win_far=45, args_k=1.5):
+    """How much each detection looks like the target (hair colour), averaged along its tracklet.
+
+    Lighting changes (bright <-> dark orange) shift every colour, so the hair metric is judged
+    per lighting: inside each lighting the hair values split into the dark-haired majority
+    and the light-haired target (Otsu threshold on log values). Each hair sample scores
+    -3..+3 by how far it lies beyond that split; detections without a sample take the
+    average of their tracklet's samples within +-win (then +-win_far) frames; otherwise they
+    stay unknown (NaN).
+    The split is "median + args_k robust standard deviations" (in log units): the target is
+    one dancer of several, so their light hair shows up as the upper outliers.
+    """
     fr = p1["det_frame"]
-    n = p1["n"]
-    fps = p1["fps"]
-    min_len = max(5, int(0.3 * fps))
-    cand = [s for s in stats if s["n"] >= min_len and s["n_hair"] >= 2 and not np.isnan(s["blonde"])]
-    if not cand:
-        raise SystemExit("no usable tracklets found")
-    others = float(np.median([s["blonde"] for s in cand]))
-
-    # ---- seed tracklet
-    if args.hint:
-        ht, hx, hy = [float(v) for v in args.hint.split(",")]
-        hf = int(round(ht * fps))
-        pt = np.array([hx * p1["W"], hy * p1["H"]])
-        best, bd = None, 1e9
-        for s in stats:
-            for d in tracks[s["id"]]["dets"]:
-                if abs(int(fr[d]) - hf) <= 2:
-                    dist = np.linalg.norm(centers[d] - pt)
-                    if dist < bd:
-                        best, bd = s, dist
-        if best is None:
-            raise SystemExit("--hint did not match any detected dancer")
-        seed = best
-        print(f"[select] seed from hint: tracklet {seed['id']}")
+    if "det_hairbox" in p1:
+        metric = p1["det_hairbox"].astype(np.float64)
     else:
-        # evidence = how much lighter than the others x how many hair samples back it up
-        seed = max(cand, key=lambda s: (s["blonde"] - others) * min(s["n_hair"], 60))
-        print(f"[select] seed tracklet {seed['id']} blonde={seed['blonde']:.1f} (median of all {others:.1f}) "
-              f"len={seed['n']} frames {seed['f0']}-{seed['f1']}")
+        hair = p1["det_hair"]
+        metric = blonde_metric(np.nan_to_num(hair[:, :3]))
+        metric[np.isnan(hair[:, 0])] = np.nan
+    raw = np.full(len(fr), np.nan)
+    cls_d = cls_frame[fr]
+    for c in np.unique(cls_d):
+        idx = np.flatnonzero((cls_d == c) & ~np.isnan(metric))
+        if len(idx) < 30:
+            continue
+        lv = np.log(np.maximum(metric[idx], 1.0))
+        med = np.median(lv)
+        spread = 1.4826 * np.median(np.abs(lv - med)) + 1e-3
+        thr = med + args_k * spread          # the target's light hair is an outlier above the majority
+        sc = (lv - thr) / spread
+        raw[idx] = np.clip(2.0 * sc, -2, 3)
+        print(f"[select] lighting {c}: hair metric typical {np.exp(med):.0f}, target threshold {np.exp(thr):.0f}; "
+              f"samples above it {np.mean(lv > thr) * 100:.1f}%")
 
-    seed_b = seed["blonde"]
-    base_b = others
-    span = max(seed_b - base_b, 15.0)
-    # when the target's hair is not much lighter than the others, rely more on clothing colour
-    w_hair = args.w_hair * float(np.clip((seed_b - base_b) / 40.0, 0.15, 1.0))
+    e = np.full(len(fr), np.nan)
+    for tr in tracks:
+        d = np.array(tr["dets"])
+        f = fr[d]
+        v = raw[d]
+        ok = ~np.isnan(v)
+        if not ok.any():
+            continue
+        fo, vo = f[ok], v[ok]
+        cs = np.concatenate([[0.0], np.cumsum(vo)])
+        for w in (win, win_far):
+            lo = np.searchsorted(fo, f - w)
+            hi = np.searchsorted(fo, f + w, side="right")
+            m = (hi > lo) & np.isnan(e[d])
+            e[d[m]] = (cs[hi[m]] - cs[lo[m]]) / (hi[m] - lo[m])
+    return e
 
-    def score(s):
-        hs = 0.5
-        if s["hist"] is not None and seed["hist"] is not None:
-            hs = hist_sim(s["hist"], seed["hist"])
-        bz = 0.3 if np.isnan(s["blonde"]) else np.clip((s["blonde"] - base_b) / span, -1, 1.5)
-        return w_hair * bz + args.w_clothes * (hs - 0.5) * 2
 
-    scored = sorted(((score(s), s) for s in stats if s["n"] >= 3), key=lambda x: -x[0])
-    for sc, s in scored[:12]:
-        print(f"   tracklet {s['id']:4d}  frames {s['f0']:5d}-{s['f1']:5d} n={s['n']:5d} "
-              f"blonde={s['blonde']:6.1f}  score={sc:5.2f}")
+def select_target(p1, tracks, tid_of, centers, heights, args):
+    """Pick the target in every frame with a Viterbi path over the detections.
 
-    seed_score = score(seed)
-    app = {s["id"]: score(s) for s in stats}
-    pool = [s for s in stats if s["n"] >= 3]
-    max_gap = int(args.stitch_gap * fps)
+    Score = appearance (relative hair + top lightness, tracklet-smoothed) per frame, minus a
+    penalty for moving far between consecutive frames, plus a small bonus for staying on the
+    same tracklet. A "not visible" state (constant score) lets the path drop out while the
+    target is hidden and re-enter on whichever detection looks like them afterwards.
+    """
+    fr = p1["det_frame"]
+    n, fps = p1["n"], p1["fps"]
+    if "light" not in p1:
+        p1["light"] = lighting_classes(args.video, n)
+    print(f"[select] frames per lighting: {np.bincount(p1['light'])}")
+    e = appearance_scores(p1, tracks, p1["light"])
+    e = e * args.hair_weight
+    hints = []
+    if args.hint:
+        hints += [h for h in args.hint.split(";") if h.strip()]
+    if args.hints_file:
+        with open(args.hints_file) as fh:
+            hints += [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+    by_frame_all = {}
+    for d, f in enumerate(fr):
+        by_frame_all.setdefault(int(f), []).append(d)
+    n_pos = n_neg = 0
+    for h in hints:
+        parts = h.split(",")
+        hf = int(round(float(parts[0]) * fps))
+        ds = by_frame_all.get(hf, [])
+        if parts[1].strip() == "none":
+            e[ds] = -8.0                       # the target is not among the detections here
+            n_neg += 1
+            continue
+        if not ds:
+            print(f"[select] hint at {parts[0]}s: no detection in that frame, ignored")
+            continue
+        pt = np.array([float(parts[1]) * p1["W"], float(parts[2]) * p1["H"]])
+        d0 = min(ds, key=lambda d: np.linalg.norm(centers[d] - pt))
+        e[ds] = -8.0
+        e[d0] = 8.0
+        # the same tracklet around the hint is very likely the target too
+        same = [d for d in tracks[tid_of[d0]]["dets"] if abs(int(fr[d]) - hf) <= int(1.5 * fps) and d != d0]
+        e[same] = np.nan_to_num(e[same]) + 1.5
+        n_pos += 1
+    if hints:
+        print(f"[select] hints: {n_pos} target positions, {n_neg} 'not visible'")
+    e_eff = np.where(np.isnan(e), args.unknown_score, e)
 
-    def ends(s, last):
-        d = tracks[s["id"]]["dets"][-1 if last else 0]
-        return int(fr[d]), centers[d], heights[d]
-
-    def stitch(cur, forward):
-        """Next tracklet after (or before) `cur`: near in space and time, similar look."""
-        f_end, c_end, h_end = ends(cur, forward)
-        best, best_cost = None, 1e9
-        for s in pool:
-            if s["id"] in used:
-                continue
-            f_s, c_s, h_s = ends(s, not forward)
-            gap = (f_s - f_end) if forward else (f_end - f_s)
-            if gap < -3 or gap > max_gap:
-                continue
-            if forward and s["f1"] <= cur["f1"]:
-                continue
-            if not forward and s["f0"] >= cur["f0"]:
-                continue
-            g = max(gap, 1)
-            dist = np.linalg.norm(c_s - c_end) / max(h_end, h_s)
-            if dist > 0.45 + 2.0 * g / fps:
-                continue
-            if app[s["id"]] < args.stitch_thr * seed_score:
-                continue
-            cost = dist + 0.6 * (seed_score - app[s["id"]]) / max(seed_score, 1e-3) + 0.3 * g / fps
-            if cost < best_cost:
-                best, best_cost = s, cost
-        if best is not None:
-            return best
-        # re-identification jump: the dancer was lost; take the next clearly matching tracklet
-        later = [s for s in pool if s["id"] not in used and s["n"] >= min_len
-                 and app[s["id"]] >= args.select_thr * seed_score
-                 and ((s["f0"] > cur["f1"] - 3) if forward else (s["f1"] < cur["f0"] + 3))]
-        if not later:
-            return None
-        return min(later, key=lambda s: (s["f0"] if forward else -s["f1"]))
-
-    used = {seed["id"]}
-    chain = [seed]
-    for forward in (True, False):
-        cur = seed
-        while True:
-            nxt = stitch(cur, forward)
-            if nxt is None:
-                break
-            used.add(nxt["id"])
-            chain.append(nxt)
-            cur = nxt
-
-    owner = np.full(n, -1, np.int32)  # detection id per frame
-    for s in sorted(chain, key=lambda s: -app[s["id"]]):
-        for d in tracks[s["id"]]["dets"]:
-            if owner[fr[d]] < 0:
-                owner[fr[d]] = d
-
-    # safety net: drop stretches where the chosen person's hair is clearly not the target's
-    hair = p1["det_hair"]
-    sel = np.flatnonzero(owner >= 0)
-    hz = np.full(n, np.nan)
-    hv = hair[owner[sel]]
-    ok = ~np.isnan(hv[:, 0])
-    hz[sel[ok]] = (blonde_metric(hv[ok]) - base_b) / span
-    samp = np.flatnonzero(~np.isnan(hz))
-    dropped = 0
-    if seed_b - base_b < 40:
-        print("[select] hair colours are not very distinct -> hair safety check skipped")
-    elif len(samp) > 9:
-        zs = median_filter(hz[samp], size=9, mode="nearest")
-        for f in samp[zs < args.hair_drop]:
-            lo, hi = max(f - args.hair_every, 0), min(f + args.hair_every + 1, n)
-            dropped += int((owner[lo:hi] >= 0).sum())
-            owner[lo:hi] = -1
-    cov = (owner >= 0).mean()
-    print(f"[select] chain of {len(chain)} tracklets, dropped {dropped} frames by hair check, "
-          f"coverage {cov * 100:.1f}% of frames")
-    return owner, seed
+    by_frame = [[] for _ in range(n)]
+    for d, f in enumerate(fr):
+        by_frame[f].append(d)
+    NEG = -1e9
+    back = []
+    prev_states, prev_score = None, None
+    for t in range(n):
+        states = by_frame[t] + [-1]
+        emis = np.array([e_eff[d] for d in by_frame[t]] + [args.null_score])
+        if prev_states is None:
+            score = emis.copy()
+            bp = np.full(len(states), -1)
+        else:
+            score = np.full(len(states), NEG)
+            bp = np.full(len(states), -1)
+            for j, d in enumerate(states):
+                for i, dp in enumerate(prev_states):
+                    if d < 0 and dp < 0:
+                        tr = 0.0
+                    elif d < 0 or dp < 0:
+                        tr = -args.switch_cost
+                    else:
+                        dist = np.linalg.norm(centers[d] - centers[dp]) / max(heights[d], heights[dp])
+                        if dist > 0.45:
+                            continue
+                        tr = -args.move_cost * (dist / 0.1) ** 2
+                        if tid_of[d] == tid_of[dp]:
+                            tr += args.same_bonus
+                    c = prev_score[i] + tr
+                    if c > score[j]:
+                        score[j], bp[j] = c, i
+            score += emis
+        back.append((states, bp))
+        prev_states, prev_score = states, score
+    owner = np.full(n, -1, np.int32)
+    j = int(np.argmax(prev_score))
+    for t in range(n - 1, -1, -1):
+        states, bp = back[t]
+        owner[t] = states[j]
+        j = bp[j] if bp[j] >= 0 else 0
+    sel = owner[owner >= 0]
+    runs = np.flatnonzero(np.diff((owner >= 0).astype(int)) == 1).size + int(owner[0] >= 0)
+    print(f"[select] target chosen in {(owner >= 0).mean() * 100:.1f}% of frames ({runs} visible stretches); "
+          f"mean appearance score of chosen {np.nanmean(e[sel]):.2f}, of others {np.nanmean(np.delete(e, sel)):.2f}")
+    hair = p1["det_hair"][sel]
+    ok = ~np.isnan(hair[:, 0])
+    seed_lab = np.median(hair[ok, :3], axis=0) if ok.any() else np.full(3, np.nan)
+    return owner, seed_lab
 
 
 # --------------------------------------------------------------------------- pass 2
@@ -647,20 +756,21 @@ def main():
     ap.add_argument("--min-height", type=float, default=0.12, help="ignore people smaller than this x frame height")
     ap.add_argument("--hair-every", type=int, default=3, help="pose/hair/clothes sampling interval (frames)")
     ap.add_argument("--crop-size", type=int, default=384)
-    ap.add_argument("--hint", default="", help="t_sec,x,y (x,y in 0..1) to point at the target manually")
-    ap.add_argument("--w-hair", type=float, default=1.0)
-    ap.add_argument("--w-clothes", type=float, default=0.6)
-    ap.add_argument("--select-thr", type=float, default=0.6,
-                    help="re-identification: fraction of the seed score a far-away tracklet needs")
-    ap.add_argument("--stitch-thr", type=float, default=0.2,
-                    help="stitching: fraction of the seed score a nearby tracklet needs")
-    ap.add_argument("--stitch-gap", type=float, default=1.0, help="max seconds between stitched tracklets")
-    ap.add_argument("--hair-drop", type=float, default=0.3,
-                    help="drop frames whose (smoothed) hair score falls below this (0=others, 1=seed)")
+    ap.add_argument("--hint", default="", help="t_sec,x,y (x,y in 0..1) to point at the target manually; "
+                    "several separated by ';'; 't_sec,none' = target not visible")
+    ap.add_argument("--hints-file", default="", help="file with one hint per line (same format as --hint)")
+    ap.add_argument("--hair-weight", type=float, default=0.3, help="weight of the automatic hair-colour score")
+    ap.add_argument("--null-score", type=float, default=0.3,
+                    help="score of 'target not visible'; a detection must look more like the target than this")
+    ap.add_argument("--unknown-score", type=float, default=0.0, help="score of a detection with no appearance sample")
+    ap.add_argument("--switch-cost", type=float, default=1.0, help="cost of dropping out / re-entering")
+    ap.add_argument("--move-cost", type=float, default=0.15, help="cost per (0.1 x body height moved)^2 between frames")
+    ap.add_argument("--same-bonus", type=float, default=0.25, help="bonus for staying on the same tracklet")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--no-pass2", action="store_true")
     ap.add_argument("--debug-video", default="")
     ap.add_argument("--cache", default="", help="pass-1 cache .npz (reused if it exists)")
+    ap.add_argument("--refresh-hair", action="store_true", help="recompute hair colours in the cache")
     args = ap.parse_args()
     args.detector_model = os.path.join(args.models, "yolox_s.onnx")
     args.model_pass1 = os.path.join(args.models, "pose_landmarker_full.task")
@@ -671,14 +781,18 @@ def main():
         z = np.load(args.cache)
         p1 = {k: (z[k].item() if z[k].ndim == 0 else z[k]) for k in z.files}
         print(f"[pass1] loaded cache {args.cache}")
+        if args.refresh_hair:
+            p1["det_hair"] = refresh_hair(args.video, p1, args.hair_model)
+            p1.pop("det_hairbox", None)
     else:
         p1 = pass1(args.video, args)
-        if args.cache:
-            np.savez_compressed(args.cache, **p1)
+    if "det_hairbox" not in p1:
+        p1["det_hairbox"] = box_hair_samples(args.video, p1, args.hair_model)
+    if args.cache:
+        np.savez_compressed(args.cache, **p1)
 
     tracks, tid_of, centers, heights = build_tracklets(p1)
-    stats = tracklet_stats(p1, tracks)
-    owner, seed = select_target(p1, tracks, stats, centers, heights, args)
+    owner, seed_lab = select_target(p1, tracks, tid_of, centers, heights, args)
 
     if args.no_pass2:
         n = p1["n"]
@@ -697,7 +811,7 @@ def main():
     print(f"[done] target box in {(owner >= 0).mean() * 100:.1f}% of frames, pose in {(src > 0).mean() * 100:.1f}% "
           f"(refined {(src == 2).mean() * 100:.1f}%)")
     np.savez_compressed(args.out, fps=p1["fps"], W=p1["W"], H=p1["H"], n=p1["n"],
-                        kp2d=kp, world=wl, src=src, box=box, seed_lab=seed["lab"])
+                        kp2d=kp, world=wl, src=src, box=box, seed_lab=seed_lab)
     if args.debug_video:
         debug_video(args.video, args.debug_video, p1, kp, src, owner)
         print(f"[debug] wrote {args.debug_video}")
