@@ -1,0 +1,6 @@
+# downloaded models (fetched by dance3d/run.sh)
+dance3d/models
+# intermediate files
+output/*.npz
+output/check_target.mp4
+__pycache__/
