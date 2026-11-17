@@ -141,49 +141,61 @@ def body_front_xz(J):
 
 # --------------------------------------------------------------------------- drawing
 
+_BG_CACHE = {}
+
+
 def bg_image(w, h):
-    t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
-    img = BG_TOP * (1 - t) + BG_BOT * t
-    return np.repeat(img, w, axis=1)
+    if (w, h) not in _BG_CACHE:
+        t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
+        _BG_CACHE[(w, h)] = np.repeat(BG_TOP * (1 - t) + BG_BOT * t, w, axis=1)
+    return _BG_CACHE[(w, h)].copy()
 
 
-def draw_floor(img, cam, centre, extent=7.0, step=0.5):
+def draw_floor(img, cam, centre, extent=7.0, step=0.5, nseg=16):
     """Perspective grid on y=0 around `centre`, fading with distance."""
+    H = img.shape[0]
     cx = np.round(centre[0] / step) * step
     cz = np.round(centre[2] / step) * step
     vals = np.arange(-extent, extent + 1e-6, step)
-    segs = []
+    lines = []
     for v in vals:
         major = abs((cx + v) % 1.0) < 1e-6 or abs((cx + v) % 1.0 - 1.0) < 1e-6
-        segs.append(([cx + v, 0, cz - extent], [cx + v, 0, cz + extent], major))
+        lines.append((np.array([cx + v, 0, cz - extent]), np.array([cx + v, 0, cz + extent]), major))
         major = abs((cz + v) % 1.0) < 1e-6 or abs((cz + v) % 1.0 - 1.0) < 1e-6
-        segs.append(([cx - extent, 0, cz + v], [cx + extent, 0, cz + v], major))
-    t = np.linspace(0, 1, 29)[:, None]
-    for a, b, major in segs:
-        a, b = np.array(a), np.array(b)
+        lines.append((np.array([cx - extent, 0, cz + v]), np.array([cx + extent, 0, cz + v]), major))
+    t = np.linspace(0, 1, nseg + 1)[:, None]
+    th = max(1, SS)
+    for a, b, major in lines:
         pts = a + (b - a) * t
         uv, z = cam.project(pts)
         d = np.linalg.norm((pts - centre)[:, [0, 2]], axis=1)
-        for k in range(len(pts) - 1):
-            if z[k] < 0.3 or z[k + 1] < 0.3:
-                continue
-            alpha = np.clip(1.0 - (d[k] + d[k + 1]) / 2 / extent, 0, 1) ** 1.3 * (0.55 if major else 0.25)
-            if alpha < 0.02:
-                continue
-            p0, p1 = uv[k], uv[k + 1]
-            base = img[int(np.clip(p0[1], 0, img.shape[0] - 1)), int(np.clip(p0[0], 0, img.shape[1] - 1))]
-            col = base * (1 - alpha) + GRID * alpha
-            cv2.line(img, tuple(np.int32(p0 * 16)), tuple(np.int32(p1 * 16)), col.tolist(),
-                     max(1, SS), cv2.LINE_AA, shift=4)
+        alpha = np.clip(1.0 - (d[:-1] + d[1:]) / 2 / extent, 0, 1) ** 1.3 * (0.55 if major else 0.25)
+        good = (z[:-1] >= 0.3) & (z[1:] >= 0.3) & (alpha >= 0.02)
+        if not good.any():
+            continue
+        ty = np.clip(uv[:-1, 1] / max(H - 1, 1), 0, 1)[:, None]
+        base = BG_TOP * (1 - ty) + BG_BOT * ty          # background colour under the line
+        cols = base * (1 - alpha[:, None]) + GRID * alpha[:, None]
+        p16 = np.int32(np.clip(uv * 16, -2e9, 2e9))
+        for k in np.flatnonzero(good):
+            cv2.line(img, (int(p16[k, 0]), int(p16[k, 1])), (int(p16[k + 1, 0]), int(p16[k + 1, 1])),
+                     cols[k].tolist(), th, cv2.LINE_AA, shift=4)
 
 
 def draw_poly_floor(img, cam, pts3, color, alpha):
     uv, z = cam.project(pts3)
     if (z < 0.3).any():
         return
-    over = img.copy()
-    cv2.fillPoly(over, [np.int32(uv * 16)], color, cv2.LINE_AA, shift=4)
-    cv2.addWeighted(over, alpha, img, 1 - alpha, 0, dst=img)
+    h, w = img.shape[:2]
+    x0, y0 = np.floor(uv.min(0)).astype(int) - 2
+    x1, y1 = np.ceil(uv.max(0)).astype(int) + 2
+    x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, w), min(y1, h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    over = roi.copy()
+    cv2.fillPoly(over, [np.int32((uv - [x0, y0]) * 16)], color, cv2.LINE_AA, shift=4)
+    img[y0:y1, x0:x1] = cv2.addWeighted(over, alpha, roi, 1 - alpha, 0)
 
 
 def draw_facing_arrow(img, cam, J):
@@ -219,8 +231,14 @@ def draw_shadow(img, cam, J, strength=0.55):
     # height-dependent fade: lifted body parts cast lighter shadows (cheap approximation)
     k = max(3, int(cam.f * 0.06 / sc / max(np.linalg.norm(cam.eye - J.mean(0)), 1)) | 1)
     sh = cv2.GaussianBlur(sh, (0, 0), k)
-    sh = cv2.resize(sh, (w, h), interpolation=cv2.INTER_LINEAR)
-    img *= (1 - strength * np.clip(sh, 0, 1))[:, :, None]
+    ys, xs = np.nonzero(sh > 2e-3)
+    if len(ys) == 0:
+        return
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    sub = cv2.resize(sh[y0:y1, x0:x1], ((x1 - x0) * sc, (y1 - y0) * sc), interpolation=cv2.INTER_LINEAR)
+    Y0, X0 = y0 * sc, x0 * sc
+    Y1, X1 = min(Y0 + sub.shape[0], h), min(X0 + sub.shape[1], w)
+    img[Y0:Y1, X0:X1] *= (1 - strength * np.clip(sub[:Y1 - Y0, :X1 - X0], 0, 1))[:, :, None]
 
 
 def shade(col, k):
@@ -499,6 +517,10 @@ class Scene:
         cx, cz = (xs.max() + xs.min()) / 2, (zs.max() + zs.min()) / 2
         self.bounds = ((cx - span / 2, cz - span / 2), (cx + span / 2, cz + span / 2))
         self.overlay = static_overlay(args.title, args.subtitle)
+        # blend the static overlay only where it has content (header, labels, legend, borders)
+        mask = cv2.dilate((self.overlay[:, :, 3] > 0).astype(np.uint8), np.ones((15, 15), np.uint8))
+        nlab, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        self.ov_rects = [tuple(int(v) for v in stats[i, :4]) for i in range(1, nlab)]
         self.duration = self.n / self.fps
 
     def sample(self, arr, t_frames):
@@ -542,7 +564,8 @@ class Scene:
         mx, my = MAIN[0] + 18, MAIN[1] + MAIN[3] - 250 - 18 - 30
         out[my:my + 250, mx:mx + 250] = cv2.addWeighted(out[my:my + 250, mx:mx + 250], 0.15, mm, 0.85, 0)
 
-        blend_rgba(out, self.overlay)
+        for (x, y, w, h) in self.ov_rects:
+            blend_rgba(out, self.overlay[y:y + h, x:x + w], x, y)
 
         # time + speed
         t_sec = t_frames / self.fps

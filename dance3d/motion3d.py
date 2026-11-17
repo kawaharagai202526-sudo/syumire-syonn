@@ -2,7 +2,7 @@
 """Turn the per-frame MediaPipe result of the target dancer into clean 3D motion.
 
 * fixes left/right label flips
-* fills short gaps, smooths jitter, keeps bone lengths constant
+* fills short gaps, removes jitter (zero-phase low-pass, no lag), keeps bone lengths constant
 * estimates where on the floor the dancer is (weak-perspective fit of the 3D pose to
   the 2D keypoints -> distance from camera) so the figure travels like in the video
 * aligns the floor to y = 0 and pins the lowest foot to it
@@ -45,6 +45,29 @@ def smooth_runs(x, valid, win, order):
         w = min(win, len(r) if len(r) % 2 else len(r) - 1)
         if w > order + 1:
             out[r] = savgol_filter(x[r], w, order, axis=0)
+    return out
+
+
+def lowpass_runs(x, valid, fps, cutoff, order=2):
+    """Zero-phase Butterworth low-pass along axis 0, separately on each run of valid frames.
+
+    Zero-phase (forward + backward) means no lag: smooth motion stays in time with the video.
+    Runs too short for the filter fall back to a Savitzky-Golay fit of similar width.
+    """
+    from scipy.signal import butter, filtfilt
+    out = x.copy()
+    idx = np.flatnonzero(valid)
+    if len(idx) == 0 or cutoff <= 0:
+        return out
+    b, a = butter(order, min(cutoff / (fps / 2), 0.99))
+    pad = 3 * max(len(a), len(b))
+    for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+        if len(r) > 3 * pad:
+            out[r] = filtfilt(b, a, x[r], axis=0, padlen=min(pad * 4, len(r) - 1), padtype="odd")
+        else:
+            w = min(len(r) if len(r) % 2 else len(r) - 1, int(fps / cutoff) | 1)
+            if w > 3:
+                out[r] = savgol_filter(x[r], w, 2, axis=0)
     return out
 
 
@@ -131,8 +154,12 @@ def main():
     ap.add_argument("-o", "--out", default="motion3d.npz")
     ap.add_argument("--fov", type=float, default=60.0, help="assumed horizontal field of view of the camera")
     ap.add_argument("--max-gap", type=float, default=1.5, help="seconds of missing pose to interpolate")
-    ap.add_argument("--smooth", type=float, default=0.23, help="pose smoothing window (s)")
-    ap.add_argument("--travel-smooth", type=float, default=0.8, help="floor-position smoothing window (s)")
+    ap.add_argument("--smooth", type=float, default=0.23, help="window (s) used to spot single-frame glitches")
+    ap.add_argument("--pose-cutoff", type=float, default=2.5,
+                    help="low-pass cutoff (Hz) for the body pose; lower = smoother")
+    ap.add_argument("--depth-cutoff", type=float, default=1.5, help="low-pass cutoff (Hz) for the depth axis")
+    ap.add_argument("--travel-cutoff", type=float, default=0.4, help="low-pass cutoff (Hz) for floor travel")
+    ap.add_argument("--lift-cutoff", type=float, default=1.5, help="low-pass cutoff (Hz) for up/down body motion")
     ap.add_argument("--depth-gain", type=float, default=0.6,
                     help="scale of front/back travel (depth estimate is noisy, so it is damped)")
     ap.add_argument("--camera", default="", help="camera.npz from camera.py (zoom/pan compensation)")
@@ -195,7 +222,13 @@ def main():
     rel = np.where(ok[:, None, None], rel, np.nan)
     rel = nan_interp(rel, max_gap=int(args.max_gap * fps))
     have = ~np.isnan(rel[:, 0, 0]) & ~np.isnan(root[:, 0])
-    rel = smooth_runs(np.nan_to_num(rel), have, win, 3)
+    rel = np.nan_to_num(rel)
+    # 1) spikes out (5-frame median), 2) zero-phase low-pass: depth (z) is the noisiest axis
+    for r in np.split(np.flatnonzero(have), np.flatnonzero(np.diff(np.flatnonzero(have)) > 1) + 1):
+        if len(r) >= 5:
+            rel[r] = median_filter(rel[r], size=(5, 1, 1), mode="nearest")
+    rel[:, :, :2] = lowpass_runs(rel[:, :, :2], have, fps, args.pose_cutoff)
+    rel[:, :, 2:] = lowpass_runs(rel[:, :, 2:], have, fps, args.depth_cutoff)
 
     lengths = {}
     root_rel = (rel[have][:, L_HIP] + rel[have][:, R_HIP]) / 2
@@ -205,8 +238,7 @@ def main():
     rel[have] = enforce_bone_lengths(rel[have], lengths)
 
     # ---- floor alignment: fit a plane through the lowest foot point of each frame
-    twin = max(5, int(args.travel_smooth * fps) | 1)
-    root_s = smooth_runs(np.nan_to_num(root), have, twin, 2)
+    root_s = lowpass_runs(np.nan_to_num(root), have, fps, args.travel_cutoff)
     abs_pts = rel + root_s[:, None]
     feet = abs_pts[:, FEET]
     low = feet[np.arange(n), np.argmin(feet[:, :, 1], axis=1)]
@@ -237,7 +269,7 @@ def main():
     # vertical: pin the lowest foot to the floor (stable, no floating / sinking)
     P = rel + root_s[:, None] * np.array([1, 0, 1])
     lowest = P[:, FEET, 1].min(axis=1)
-    lift = smooth_runs(-lowest, have, max(3, int(0.1 * fps) | 1), 1)
+    lift = lowpass_runs(-lowest, have, fps, args.lift_cutoff)
     P[:, :, 1] += lift[:, None]
     P[~have] = np.nan
 
